@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   Search, Plus, Upload, Moon, Sun, Menu, 
   Trash2, Edit2, Loader2, Cloud, CheckCircle2, AlertCircle,
-  Pin, Settings, Lock, CloudCog, Github
+  Pin, Settings, Lock, CloudCog, Github, GitFork
 } from 'lucide-react';
 import { LinkItem, Category, DEFAULT_CATEGORIES, INITIAL_LINKS, WebDavConfig } from './types';
 import { parseBookmarks } from './services/bookmarkParser';
@@ -13,6 +13,10 @@ import CategoryManagerModal from './components/CategoryManagerModal';
 import BackupModal from './components/BackupModal';
 import CategoryAuthModal from './components/CategoryAuthModal';
 import ImportModal from './components/ImportModal';
+
+// --- 配置项 ---
+// TODO: 请将此处修改为您自己的 GitHub 仓库地址
+const GITHUB_REPO_URL = 'https://github.com/maodeyu180/mao_nav';
 
 const LOCAL_STORAGE_KEY = 'cloudnav_data_cache';
 const AUTH_KEY = 'cloudnav_auth_token';
@@ -530,14 +534,14 @@ function App() {
                </div>
 
                <a 
-                 href="https://github.com/maodeyu180/mao_nav" 
+                 href={GITHUB_REPO_URL} 
                  target="_blank" 
                  rel="noopener noreferrer"
                  className="flex items-center gap-1 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 transition-colors"
                  title="Fork this project on GitHub"
                >
-                 <Github size={14} />
-                 <span>Github</span>
+                 <GitFork size={14} />
+                 <span>Fork 项目</span>
                </a>
             </div>
         </div>
