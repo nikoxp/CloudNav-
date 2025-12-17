@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { X, Save, Bot, Key, Globe, Sparkles, PauseCircle, Wrench, Box, Copy, Check, List, GripVertical, Filter, LayoutTemplate, RefreshCw, Info, Download, Sidebar, Keyboard, MousePointerClick, AlertTriangle, Package, Zap } from 'lucide-react';
+import { X, Save, Bot, Key, Globe, Sparkles, PauseCircle, Wrench, Box, Copy, Check, List, GripVertical, Filter, LayoutTemplate, RefreshCw, Info, Download, Sidebar, Keyboard, MousePointerClick, AlertTriangle, Package, Zap, Menu } from 'lucide-react';
 import { AIConfig, LinkItem, Category, SiteSettings } from '../types';
 import { generateLinkDescription } from '../services/geminiService';
 import JSZip from 'jszip';
@@ -228,15 +228,15 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
       return links.filter(l => l.categoryId === filterCategory);
   }, [links, filterCategory]);
 
-  // Extension Generators v7.4
+  // Extension Generators v7.6
   const getManifestJson = () => {
     const json: any = {
         manifest_version: 3,
         name: (localSiteSettings.navTitle || "CloudNav") + " Pro",
-        version: "7.4",
+        version: "7.6",
         minimum_chrome_version: "116",
-        description: "CloudNav - 侧边栏与智能保存",
-        permissions: ["activeTab", "scripting", "sidePanel", "storage", "favicon", "contextMenus", "notifications"],
+        description: "CloudNav - 极速侧边栏与智能收藏",
+        permissions: ["activeTab", "scripting", "sidePanel", "storage", "favicon", "contextMenus", "notifications", "tabs"],
         background: {
             service_worker: "background.js"
         },
@@ -272,14 +272,42 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
     return JSON.stringify(json, null, 2);
   };
 
-  const extBackgroundJs = `// background.js - CloudNav Assistant v7.4
+  const extBackgroundJs = `// background.js - CloudNav Assistant v7.6
 // 内置配置
 const CONFIG = {
   apiBase: "${domain}",
   password: "${password}"
 };
 
-// --- 1. 侧边栏交互 (左键 / 快捷键) ---
+// 缓存数据
+let linkCache = [];
+let categoryCache = [];
+
+// --- 1. 初始化与缓存管理 ---
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false }).catch(() => {});
+  
+  // 初始化菜单
+  refreshCache().then(buildMenus);
+});
+
+// 监听存储变化，实时更新缓存和菜单
+chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.cloudnav_data) {
+        refreshCache().then(buildMenus);
+    }
+});
+
+async function refreshCache() {
+    const data = await chrome.storage.local.get('cloudnav_data');
+    if (data && data.cloudnav_data) {
+        linkCache = data.cloudnav_data.links || [];
+        categoryCache = data.cloudnav_data.categories || [];
+    }
+    return;
+}
+
+// --- 2. 侧边栏交互 (左键 / 快捷键) ---
 const windowPorts = {};
 
 chrome.runtime.onConnect.addListener((port) => {
@@ -316,79 +344,137 @@ chrome.action.onClicked.addListener(async (tab) => {
     }
 });
 
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false }).catch(() => {});
-  
-  chrome.contextMenus.create({
-      id: "save_to_cloudnav_modal",
-      title: "📥 保存到 CloudNav (窗口)",
-      contexts: ["page", "link", "action"]
-  });
+// --- 3. 统一菜单逻辑 (核心功能) ---
+
+// 构建菜单结构
+function buildMenus() {
+    chrome.contextMenus.removeAll(() => {
+        // 创建一个统一的根菜单，同时支持 "page" (网页右键), "link" (链接右键), "action" (图标右键)
+        chrome.contextMenus.create({
+            id: "cloudnav_root",
+            title: "⚡ 保存到 CloudNav",
+            contexts: ["page", "link", "action"]
+        });
+
+        // 动态生成分类子菜单
+        if (categoryCache.length > 0) {
+            categoryCache.forEach(cat => {
+                chrome.contextMenus.create({
+                    id: \`save_to_\${cat.id}\`,
+                    parentId: "cloudnav_root",
+                    title: cat.name,
+                    contexts: ["page", "link", "action"]
+                });
+            });
+        } else {
+            chrome.contextMenus.create({
+                id: "save_to_common",
+                parentId: "cloudnav_root",
+                title: "默认分类",
+                contexts: ["page", "link", "action"]
+            });
+        }
+    });
+}
+
+// 动态更新标题 (判重逻辑)
+function updateMenuTitle(url) {
+    if (!url) return;
+    const cleanUrl = url.replace(/\\/$/, '').toLowerCase();
+    
+    // 检查是否存在
+    const exists = linkCache.some(l => l.url && l.url.replace(/\\/$/, '').toLowerCase() === cleanUrl);
+    
+    const newTitle = exists ? "⚠️ 已存在 - 保存到 CloudNav" : "⚡ 保存到 CloudNav";
+    
+    // 仅更新标题，不重绘整个菜单，性能更高
+    chrome.contextMenus.update("cloudnav_root", { title: newTitle }, () => {
+        if (chrome.runtime.lastError) { /* ignore if menu not ready */ }
+    });
+}
+
+// 监听标签页变化，触发判重检查
+chrome.tabs.onActivated.addListener(async (activeInfo) => {
+   try {
+       const tab = await chrome.tabs.get(activeInfo.tabId);
+       if (tab && tab.url) updateMenuTitle(tab.url);
+   } catch(e){}
 });
 
-// --- 2. 核心逻辑：注入式模态框 ---
-chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-    if (info.menuItemId === "save_to_cloudnav_modal") {
-        if (!tab || !tab.id) return;
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+   if (changeInfo.status === 'complete' && tab.active && tab.url) {
+       updateMenuTitle(tab.url);
+   }
+});
 
-        // 1. 获取最新数据 (分类和链接) 用于判重
-        const storage = await chrome.storage.local.get('cloudnav_data');
-        const data = storage.cloudnav_data || { categories: [], links: [] };
+// --- 4. 菜单点击处理 ---
+chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+    // 统一处理所有 "save_to_" 开头的点击事件
+    if (String(info.menuItemId).startsWith("save_to_")) {
+        const catId = String(info.menuItemId).replace("save_to_", "");
+        // 优先使用 linkUrl (如果是右键点击链接)，否则使用当前标签页的 url/title
+        // 注意：如果是点击图标右键 (Action context), info.linkUrl 也是 undefined，会自动回退到 tab.url
+        const title = tab.title;
+        const url = info.linkUrl || tab.url;
         
-        // 2. 注入 CSS 和 JS
-        try {
-            await chrome.scripting.executeScript({
-                target: { tabId: tab.id },
-                func: injectModal,
-                args: [data, CONFIG]
-            });
-        } catch(e) {
-            console.error("Injection failed", e);
-            notify("无法在当前页面打开窗口", "请尝试刷新页面或在普通网页使用。");
+        // 简单判重 (仅用于通知提示，不阻止保存)
+        const cleanUrl = url.replace(/\\/$/, '').toLowerCase();
+        const exists = linkCache.some(l => l.url.replace(/\\/$/, '').toLowerCase() === cleanUrl);
+        
+        if (exists) {
+            // 如果已存在，再次保存通常意味着用户想更新或者不介意重复，
+            // 但为了防止误操作，这里可以简单弹个确认，或者直接保存。
+            // 由于 Context Menu 无法直接弹 confirm (除非注入脚本)，我们这里直接保存但提示已存在。
+            // 用户已经看到 "⚠️ 已存在" 的标题了，点击说明确实想存。
         }
+
+        saveLink(title, url, catId);
     }
 });
 
-// --- 3. 监听来自注入页面的保存请求 ---
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.type === 'save_link_api') {
-        const { title, url, categoryId, icon } = message.payload;
-        
-        if (!CONFIG.password) {
-            sendResponse({ success: false, error: '未配置密码，请先在侧边栏登录' });
-            return true;
-        }
+// 通用保存逻辑
+async function saveLink(title, url, categoryId, icon = '') {
+    if (!CONFIG.password) {
+        notify('保存失败', '未配置密码，请先在侧边栏登录。');
+        return;
+    }
 
-        fetch(\`\${CONFIG.apiBase}/api/link\`, {
+    if (!icon) {
+        try {
+            const u = new URL(url);
+            icon = \`https://t2.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL&url=\${encodeURIComponent(u.origin)}&size=128\`;
+        } catch(e){}
+    }
+
+    try {
+        const res = await fetch(\`\${CONFIG.apiBase}/api/link\`, {
             method: 'POST',
             headers: { 
                 'Content-Type': 'application/json',
                 'x-auth-password': CONFIG.password
             },
-            body: JSON.stringify({ title, url, categoryId, icon })
-        })
-        .then(res => {
-            if (res.ok) {
-                // 保存成功后，刷新侧边栏
-                chrome.runtime.sendMessage({ type: 'refresh' }).catch(()=>{});
-                // 更新本地缓存
-                chrome.storage.local.get('cloudnav_data').then((cached) => {
-                    const data = cached.cloudnav_data || { links: [] };
-                    data.links.unshift({ id: Date.now().toString(), title, url, categoryId, icon });
-                    chrome.storage.local.set({ cloudnav_data: data });
-                });
-                sendResponse({ success: true });
-            } else {
-                sendResponse({ success: false, error: \`Server Error: \${res.status}\` });
-            }
-        })
-        .catch(err => {
-            sendResponse({ success: false, error: 'Network Error' });
+            body: JSON.stringify({
+                title: title || '未命名',
+                url: url,
+                categoryId: categoryId,
+                icon: icon
+            })
         });
 
-        return true; // Keep channel open
+        if (res.ok) {
+            notify('保存成功', \`已保存到 CloudNav\`);
+            chrome.runtime.sendMessage({ type: 'refresh' }).catch(() => {});
+            // 乐观更新缓存
+            const newLink = { id: Date.now().toString(), title, url, categoryId, icon };
+            linkCache.unshift(newLink);
+            updateMenuTitle(url); // 立即更新右键菜单状态
+        } else {
+            notify('保存失败', \`服务器错误: \${res.status}\`);
+        }
+    } catch (e) {
+        notify('保存失败', '网络请求错误');
     }
-});
+}
 
 function notify(title, message) {
     chrome.notifications.create({
@@ -398,131 +484,6 @@ function notify(title, message) {
         message: message,
         priority: 1
     });
-}
-
-// --- 4. 注入的脚本逻辑 (作为字符串存在 Background 中) ---
-async function injectModal(data, config) {
-    // 检查是否已存在
-    const existingHost = document.getElementById('cloudnav-shadow-host');
-    if (existingHost) {
-        existingHost.remove(); // Toggle off if already open
-        return;
-    }
-
-    // 创建 Shadow DOM 容器 (避免样式冲突)
-    const host = document.createElement('div');
-    host.id = 'cloudnav-shadow-host';
-    host.style.position = 'fixed';
-    host.style.top = '20px';
-    host.style.right = '20px';
-    host.style.zIndex = '2147483647'; // Max Z-Index
-    host.style.width = '320px';
-    host.style.fontFamily = 'sans-serif';
-    document.body.appendChild(host);
-
-    const shadow = host.attachShadow({ mode: 'open' });
-
-    // 当前页面信息
-    const currentUrl = window.location.href;
-    const currentTitle = document.title;
-    
-    // 判重逻辑
-    // Remove trailing slash for looser matching
-    const cleanUrl = currentUrl.replace(/\\/$/, '');
-    const duplicate = data.links.find(l => l.url.replace(/\\/$/, '') === cleanUrl);
-    
-    // 默认分类
-    const categories = data.categories.length > 0 ? data.categories : [{id:'common', name:'默认分类'}];
-
-    // CSS
-    const style = document.createElement('style');
-    style.textContent = \`
-        .modal { background: #fff; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.2); padding: 16px; border: 1px solid #e2e8f0; color: #1e293b; box-sizing: border-box; }
-        @media (prefers-color-scheme: dark) {
-            .modal { background: #1e293b; color: #f1f5f9; border-color: #334155; }
-            input, select { background: #0f172a !important; color: #fff !important; border-color: #334155 !important; }
-        }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-        .title { font-weight: 600; font-size: 15px; }
-        .close-btn { cursor: pointer; padding: 4px; border-radius: 4px; background: transparent; border: none; color: #94a3b8; }
-        .close-btn:hover { background: rgba(0,0,0,0.05); color: #64748b; }
-        .form-group { margin-bottom: 12px; }
-        label { display: block; font-size: 12px; margin-bottom: 4px; color: #64748b; font-weight: 500; }
-        input, select { width: 100%; padding: 8px; border: 1px solid #cbd5e1; border-radius: 6px; box-sizing: border-box; font-size: 13px; outline: none; }
-        input:focus, select:focus { border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.1); }
-        .warning { background: #fffbeb; color: #d97706; padding: 8px; border-radius: 6px; font-size: 12px; margin-bottom: 12px; border: 1px solid #fcd34d; display: flex; align-items: center; gap: 6px; }
-        .btn { width: 100%; background: #3b82f6; color: white; border: none; padding: 10px; border-radius: 6px; font-weight: 500; cursor: pointer; font-size: 13px; transition: background 0.2s; }
-        .btn:hover { background: #2563eb; }
-        .btn:disabled { background: #94a3b8; cursor: not-allowed; }
-        .status { margin-top: 8px; font-size: 12px; text-align: center; height: 16px; }
-        .status.error { color: #ef4444; }
-        .status.success { color: #10b981; }
-    \`;
-    shadow.appendChild(style);
-
-    // HTML
-    const container = document.createElement('div');
-    container.className = 'modal';
-    container.innerHTML = \`
-        <div class="header">
-            <div class="title">CloudNav 保存</div>
-            <button class="close-btn" id="close">✕</button>
-        </div>
-        \${duplicate ? \`<div class="warning">⚠️ 此链接已存在于 [ \${categories.find(c=>c.id===duplicate.categoryId)?.name || '未知分类'} ]</div>\` : ''}
-        <div class="form-group">
-            <label>标题</label>
-            <input type="text" id="title" value="\${currentTitle.replace(/"/g, '&quot;')}" />
-        </div>
-        <div class="form-group">
-            <label>分类</label>
-            <select id="category">
-                \${categories.map(c => \`<option value="\${c.id}" \${duplicate && duplicate.categoryId === c.id ? 'selected' : ''}>\${c.name}</option>\`).join('')}
-            </select>
-        </div>
-        <button class="btn" id="save">\${duplicate ? '更新链接' : '保存链接'}</button>
-        <div class="status" id="status"></div>
-    \`;
-    shadow.appendChild(container);
-
-    // Logic
-    const closeBtn = shadow.getElementById('close');
-    const saveBtn = shadow.getElementById('save');
-    const statusDiv = shadow.getElementById('status');
-    const titleInput = shadow.getElementById('title');
-    const catSelect = shadow.getElementById('category');
-
-    closeBtn.onclick = () => host.remove();
-
-    saveBtn.onclick = () => {
-        const title = titleInput.value;
-        const categoryId = catSelect.value;
-        
-        saveBtn.disabled = true;
-        saveBtn.innerText = '保存中...';
-        
-        // Icon
-        let iconUrl = '';
-        try {
-            const u = new URL(currentUrl);
-            iconUrl = \`https://t2.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL&url=\${encodeURIComponent(u.origin)}&size=128\`;
-        } catch(e){}
-
-        chrome.runtime.sendMessage({
-            type: 'save_link_api',
-            payload: { title, url: currentUrl, categoryId, icon: iconUrl }
-        }, (response) => {
-            if (response && response.success) {
-                statusDiv.className = 'status success';
-                statusDiv.innerText = '保存成功!';
-                setTimeout(() => host.remove(), 1000);
-            } else {
-                statusDiv.className = 'status error';
-                statusDiv.innerText = response?.error || '保存失败';
-                saveBtn.disabled = false;
-                saveBtn.innerText = '重试';
-            }
-        });
-    };
 }
 `;
 
@@ -1237,15 +1198,16 @@ document.addEventListener('DOMContentLoaded', async () => {
                                         className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-70 disabled:cursor-not-allowed text-white font-bold py-3 px-4 rounded-xl transition-colors shadow-lg shadow-blue-500/20"
                                     >
                                         <Package size={20} />
-                                        {isZipping ? '打包中...' : '📦 一键下载所有文件 (v7.4 Pro)'}
+                                        {isZipping ? '打包中...' : '📦 一键下载所有文件 (v7.6 Pro)'}
                                     </button>
                                 </div>
                                 
                                 <div className="p-3 bg-green-50 dark:bg-green-900/20 text-green-800 dark:text-green-200 rounded border border-green-200 dark:border-green-900/50 text-sm space-y-2">
-                                    <div className="font-bold flex items-center gap-2"><Zap size={16}/> 极速方案 (v7.4):</div>
+                                    <div className="font-bold flex items-center gap-2"><Zap size={16}/> 完美交互方案 (v7.6):</div>
                                     <ul className="list-disc list-inside text-xs space-y-1">
                                         <li><strong>左键 / 快捷键:</strong> 极速打开/关闭侧边栏 (无弹窗延迟)。</li>
-                                        <li><strong>右键菜单:</strong> "保存到 CloudNav" - 在当前页面内弹出悬浮窗口（支持判重、编辑）。</li>
+                                        <li><strong>网页右键:</strong> 直接展示分类列表 (支持判重警告)。</li>
+                                        <li><strong>图标右键:</strong> 同上，统一为级联菜单，直接保存。</li>
                                     </ul>
                                 </div>
                             </div>
