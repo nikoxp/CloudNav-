@@ -100,7 +100,7 @@ export const onRequestPost = async (context: { request: Request; env: Env }) => 
         categoryId: targetCatId, 
         createdAt: Date.now(),
         pinned: false,
-        icon: undefined
+        icon: newLinkData.icon || undefined // 允许保存传入的 icon
     };
 
     // 5. Append

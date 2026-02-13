@@ -3,10 +3,13 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   Search, Plus, Upload, Moon, Sun, Menu, 
   Trash2, Edit2, Loader2, Cloud, CheckCircle2, AlertCircle,
-  Pin, Settings, Lock, CloudCog, Github, GitFork
+  Pin, Settings, Lock, CloudCog, Github, GitFork, MoreVertical,
+  QrCode, Copy, LayoutGrid, List, Check, ExternalLink, ArrowRight
 } from 'lucide-react';
-import { LinkItem, Category, DEFAULT_CATEGORIES, INITIAL_LINKS, WebDavConfig, AIConfig } from './types';
-import { parseBookmarks } from './services/bookmarkParser';
+import { 
+    LinkItem, Category, DEFAULT_CATEGORIES, INITIAL_LINKS, 
+    WebDavConfig, AIConfig, SiteSettings, SearchEngine, DEFAULT_SEARCH_ENGINES 
+} from './types';
 import Icon from './components/Icon';
 import LinkModal from './components/LinkModal';
 import AuthModal from './components/AuthModal';
@@ -15,29 +18,58 @@ import BackupModal from './components/BackupModal';
 import CategoryAuthModal from './components/CategoryAuthModal';
 import ImportModal from './components/ImportModal';
 import SettingsModal from './components/SettingsModal';
+import SearchSettingsModal from './components/SearchSettingsModal';
 
-// --- 配置项 ---
-// 项目核心仓库地址
 const GITHUB_REPO_URL = 'https://github.com/sese972010/CloudNav-';
 
 const LOCAL_STORAGE_KEY = 'cloudnav_data_cache';
 const AUTH_KEY = 'cloudnav_auth_token';
 const WEBDAV_CONFIG_KEY = 'cloudnav_webdav_config';
 const AI_CONFIG_KEY = 'cloudnav_ai_config';
+const SEARCH_ENGINES_KEY = 'cloudnav_search_engines';
 
 function App() {
   // --- State ---
   const [links, setLinks] = useState<LinkItem[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
-  const [selectedCategory, setSelectedCategory] = useState<string>('all');
+  const [activeCategory, setActiveCategory] = useState<string>('all'); 
   const [searchQuery, setSearchQuery] = useState('');
+  
+  // New Search State
+  const [searchMode, setSearchMode] = useState<'local' | 'external'>('local');
+  const [externalEngines, setExternalEngines] = useState<SearchEngine[]>(() => {
+      const saved = localStorage.getItem(SEARCH_ENGINES_KEY);
+      if (saved) {
+          try { return JSON.parse(saved); } catch(e) {}
+      }
+      // Filter out 'local' from defaults for the external list
+      return DEFAULT_SEARCH_ENGINES.filter(e => e.id !== 'local');
+  });
+  const [activeEngineId, setActiveEngineId] = useState<string>(() => {
+      return externalEngines[0]?.id || 'google';
+  });
+  const [isSearchSettingsOpen, setIsSearchSettingsOpen] = useState(false);
+
   const [darkMode, setDarkMode] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   
-  // Category Security State
+  // Site Settings - Initialized with defaults to prevent crash
+  const [siteSettings, setSiteSettings] = useState<SiteSettings>({
+      title: 'CloudNav - 我的导航',
+      navTitle: '云航 CloudNav',
+      favicon: '',
+      cardStyle: 'detailed'
+  });
+  
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+
+  // Context Menu State
+  const [contextMenu, setContextMenu] = useState<{ x: number, y: number, link: LinkItem | null } | null>(null);
+  
+  const [qrCodeLink, setQrCodeLink] = useState<LinkItem | null>(null);
+
   const [unlockedCategoryIds, setUnlockedCategoryIds] = useState<Set<string>>(new Set());
 
-  // WebDAV Config State
   const [webDavConfig, setWebDavConfig] = useState<WebDavConfig>({
       url: '',
       username: '',
@@ -45,7 +77,6 @@ function App() {
       enabled: false
   });
 
-  // AI Config State
   const [aiConfig, setAiConfig] = useState<AIConfig>(() => {
       const saved = localStorage.getItem(AI_CONFIG_KEY);
       if (saved) {
@@ -53,17 +84,23 @@ function App() {
               return JSON.parse(saved);
           } catch (e) {}
       }
+      
+      // Safe access to process env
+      let defaultKey = '';
+      try {
+          if (typeof process !== 'undefined' && process.env && process.env.API_KEY) {
+              defaultKey = process.env.API_KEY;
+          }
+      } catch(e) {}
+
       return {
           provider: 'gemini',
-          // Try to use injected env if available, else empty.
-          // Note: In client-side build process.env might need specific config, but we leave it as fallback.
-          apiKey: process.env.API_KEY || '', 
+          apiKey: defaultKey, 
           baseUrl: '',
           model: 'gemini-2.5-flash'
       };
   });
   
-  // Modals
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isAuthOpen, setIsAuthOpen] = useState(false);
   const [isCatManagerOpen, setIsCatManagerOpen] = useState(false);
@@ -73,14 +110,17 @@ function App() {
   const [catAuthModalData, setCatAuthModalData] = useState<Category | null>(null);
   
   const [editingLink, setEditingLink] = useState<LinkItem | undefined>(undefined);
-  // State for data pre-filled from Bookmarklet
   const [prefillLink, setPrefillLink] = useState<Partial<LinkItem> | undefined>(undefined);
   
-  // Sync State
   const [syncStatus, setSyncStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [authToken, setAuthToken] = useState<string>('');
-  
-  // --- Helpers & Sync Logic ---
+
+  const mainRef = useRef<HTMLDivElement>(null);
+  const isAutoScrollingRef = useRef(false);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
+
+  // --- Helpers ---
 
   const loadFromLocal = () => {
     const stored = localStorage.getItem(LOCAL_STORAGE_KEY);
@@ -89,6 +129,7 @@ function App() {
         const parsed = JSON.parse(stored);
         setLinks(parsed.links || INITIAL_LINKS);
         setCategories(parsed.categories || DEFAULT_CATEGORIES);
+        if (parsed.settings) setSiteSettings(prev => ({ ...prev, ...parsed.settings }));
       } catch (e) {
         setLinks(INITIAL_LINKS);
         setCategories(DEFAULT_CATEGORIES);
@@ -99,7 +140,7 @@ function App() {
     }
   };
 
-  const syncToCloud = async (newLinks: LinkItem[], newCategories: Category[], token: string) => {
+  const syncToCloud = async (newLinks: LinkItem[], newCategories: Category[], newSettings: SiteSettings, token: string) => {
     setSyncStatus('saving');
     try {
         const response = await fetch('/api/storage', {
@@ -108,7 +149,7 @@ function App() {
                 'Content-Type': 'application/json',
                 'x-auth-password': token
             },
-            body: JSON.stringify({ links: newLinks, categories: newCategories })
+            body: JSON.stringify({ links: newLinks, categories: newCategories, settings: newSettings })
         });
 
         if (response.status === 401) {
@@ -131,34 +172,24 @@ function App() {
     }
   };
 
-  const updateData = (newLinks: LinkItem[], newCategories: Category[]) => {
-      // 1. Optimistic UI Update
+  const updateData = (newLinks: LinkItem[], newCategories: Category[], newSettings: SiteSettings = siteSettings) => {
       setLinks(newLinks);
       setCategories(newCategories);
-      
-      // 2. Save to Local Cache
-      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify({ links: newLinks, categories: newCategories }));
-
-      // 3. Sync to Cloud (if authenticated)
+      setSiteSettings(newSettings);
+      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify({ links: newLinks, categories: newCategories, settings: newSettings }));
       if (authToken) {
-          syncToCloud(newLinks, newCategories, authToken);
+          syncToCloud(newLinks, newCategories, newSettings, authToken);
       }
   };
 
-  // --- Effects ---
-
   useEffect(() => {
-    // Theme init
     if (localStorage.getItem('theme') === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
       setDarkMode(true);
       document.documentElement.classList.add('dark');
     }
-
-    // Load Token
     const savedToken = localStorage.getItem(AUTH_KEY);
     if (savedToken) setAuthToken(savedToken);
 
-    // Load WebDAV Config
     const savedWebDav = localStorage.getItem(WEBDAV_CONFIG_KEY);
     if (savedWebDav) {
         try {
@@ -166,24 +197,20 @@ function App() {
         } catch (e) {}
     }
 
-    // Handle URL Params for Bookmarklet (Add Link)
     const urlParams = new URLSearchParams(window.location.search);
     const addUrl = urlParams.get('add_url');
     if (addUrl) {
         const addTitle = urlParams.get('add_title') || '';
-        // Clean URL params to avoid re-triggering on refresh
         window.history.replaceState({}, '', window.location.pathname);
-        
         setPrefillLink({
             title: addTitle,
             url: addUrl,
-            categoryId: 'common' // Default, Modal will handle selection
+            categoryId: 'common'
         });
         setEditingLink(undefined);
         setIsModalOpen(true);
     }
 
-    // Initial Data Fetch
     const initData = async () => {
         try {
             const res = await fetch('/api/storage');
@@ -192,6 +219,7 @@ function App() {
                 if (data.links && data.links.length > 0) {
                     setLinks(data.links);
                     setCategories(data.categories || DEFAULT_CATEGORIES);
+                    if (data.settings) setSiteSettings(prev => ({ ...prev, ...data.settings }));
                     localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(data));
                     return;
                 }
@@ -205,6 +233,72 @@ function App() {
     initData();
   }, []);
 
+  useEffect(() => {
+      document.title = siteSettings.title || 'CloudNav';
+      const link = document.querySelector("link[rel~='icon']") as HTMLLinkElement;
+      if (link && siteSettings.favicon) {
+          link.href = siteSettings.favicon;
+      }
+  }, [siteSettings]);
+
+  useEffect(() => {
+      const handleClickOutside = (e: MouseEvent) => {
+          if (openMenuId) setOpenMenuId(null);
+          if (contextMenu && contextMenuRef.current && !contextMenuRef.current.contains(e.target as Node)) {
+             setContextMenu(null);
+          }
+      };
+      
+      const handleScroll = () => {
+         if (contextMenu) setContextMenu(null);
+      };
+
+      window.addEventListener('click', handleClickOutside);
+      window.addEventListener('scroll', handleScroll, true); 
+      
+      const handleGlobalContextMenu = (e: MouseEvent) => {
+          if (contextMenu) {
+              e.preventDefault();
+              setContextMenu(null);
+          }
+      }
+      window.addEventListener('contextmenu', handleGlobalContextMenu);
+
+      return () => {
+          window.removeEventListener('click', handleClickOutside);
+          window.removeEventListener('scroll', handleScroll, true);
+          window.removeEventListener('contextmenu', handleGlobalContextMenu);
+      }
+  }, [openMenuId, contextMenu]);
+
+  useEffect(() => {
+    const handleScroll = () => {
+        if (isAutoScrollingRef.current) return;
+        if (!mainRef.current) return;
+        
+        const scrollPosition = mainRef.current.scrollTop + 150;
+
+        if (mainRef.current.scrollTop < 80) {
+            setActiveCategory('all');
+            return;
+        }
+
+        let currentCatId = 'all';
+        for (const cat of categories) {
+            const el = document.getElementById(`cat-${cat.id}`);
+            if (el && el.offsetTop <= scrollPosition && (el.offsetTop + el.offsetHeight) > scrollPosition) {
+                currentCatId = cat.id;
+                break;
+            }
+        }
+        if (currentCatId !== 'all') setActiveCategory(currentCatId);
+    };
+
+    const mainEl = mainRef.current;
+    if (mainEl) mainEl.addEventListener('scroll', handleScroll);
+    return () => mainEl?.removeEventListener('scroll', handleScroll);
+  }, [categories]);
+
   const toggleTheme = () => {
     const newMode = !darkMode;
     setDarkMode(newMode);
@@ -217,8 +311,7 @@ function App() {
     }
   };
 
-  // --- Actions ---
-
+  // --- Handlers ---
   const handleLogin = async (password: string): Promise<boolean> => {
       try {
         const response = await fetch('/api/storage', {
@@ -227,7 +320,7 @@ function App() {
                 'Content-Type': 'application/json',
                 'x-auth-password': password
             },
-            body: JSON.stringify({ links, categories })
+            body: JSON.stringify({ links, categories, settings: siteSettings })
         });
         
         if (response.ok) {
@@ -244,14 +337,12 @@ function App() {
   };
 
   const handleImportConfirm = (newLinks: LinkItem[], newCategories: Category[]) => {
-      // Merge categories: Avoid duplicate names/IDs
       const mergedCategories = [...categories];
       newCategories.forEach(nc => {
           if (!mergedCategories.some(c => c.id === nc.id || c.name === nc.name)) {
               mergedCategories.push(nc);
           }
       });
-
       const mergedLinks = [...links, ...newLinks];
       updateData(mergedLinks, mergedCategories);
       setIsImportModalOpen(false);
@@ -266,7 +357,6 @@ function App() {
       createdAt: Date.now()
     };
     updateData([newLink, ...links], categories);
-    // Clear prefill if any
     setPrefillLink(undefined);
   };
 
@@ -278,67 +368,71 @@ function App() {
     setEditingLink(undefined);
   };
 
-  const handleDeleteLink = (id: string, e: React.MouseEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
+  const handleDeleteLink = (id: string) => {
     if (!authToken) { setIsAuthOpen(true); return; }
     if (confirm('确定删除此链接吗?')) {
       updateData(links.filter(l => l.id !== id), categories);
     }
   };
 
-  const togglePin = (id: string, e: React.MouseEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
+  const togglePin = (id: string) => {
       if (!authToken) { setIsAuthOpen(true); return; }
       const updated = links.map(l => l.id === id ? { ...l, pinned: !l.pinned } : l);
       updateData(updated, categories);
   };
-
-  const handleSaveAIConfig = (config: AIConfig) => {
-      setAiConfig(config);
-      localStorage.setItem(AI_CONFIG_KEY, JSON.stringify(config));
+  
+  const handleCopyLink = (text: string) => {
+      navigator.clipboard.writeText(text);
   };
 
-  // --- Category Management & Security ---
+  const handleSaveAIConfig = (config: AIConfig, newSiteSettings: SiteSettings) => {
+      setAiConfig(config);
+      localStorage.setItem(AI_CONFIG_KEY, JSON.stringify(config));
+      if (authToken) {
+          updateData(links, categories, newSiteSettings);
+      } else {
+          setSiteSettings(newSiteSettings);
+          localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify({ links, categories, settings: newSiteSettings }));
+      }
+  };
 
-  const handleCategoryClick = (cat: Category) => {
-      // If category has password and is NOT unlocked
-      if (cat.password && !unlockedCategoryIds.has(cat.id)) {
-          setCatAuthModalData(cat);
-          setSidebarOpen(false);
+  const scrollToCategory = (catId: string) => {
+      setActiveCategory(catId);
+      setSidebarOpen(false);
+      
+      if (catId === 'all') {
+          isAutoScrollingRef.current = true;
+          mainRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+          setTimeout(() => isAutoScrollingRef.current = false, 800);
           return;
       }
-      setSelectedCategory(cat.id);
-      setSidebarOpen(false);
+      const el = document.getElementById(`cat-${catId}`);
+      if (el) {
+          isAutoScrollingRef.current = true;
+          const top = el.offsetTop - 80;
+          mainRef.current?.scrollTo({ top, behavior: 'smooth' });
+          setTimeout(() => isAutoScrollingRef.current = false, 800);
+      }
   };
 
   const handleUnlockCategory = (catId: string) => {
       setUnlockedCategoryIds(prev => new Set(prev).add(catId));
-      setSelectedCategory(catId);
   };
 
-  const handleUpdateCategories = (newCats: Category[]) => {
+  const handleUpdateCategories = (newCats: Category[], newLinks?: LinkItem[]) => {
       if (!authToken) { setIsAuthOpen(true); return; }
-      updateData(links, newCats);
+      updateData(newLinks || links, newCats);
   };
 
   const handleDeleteCategory = (catId: string) => {
       if (!authToken) { setIsAuthOpen(true); return; }
       const newCats = categories.filter(c => c.id !== catId);
-      // Move links to common or first available
       const targetId = 'common'; 
       const newLinks = links.map(l => l.categoryId === catId ? { ...l, categoryId: targetId } : l);
-      
-      // Ensure common exists if we deleted everything
-      if (newCats.length === 0) {
-          newCats.push(DEFAULT_CATEGORIES[0]);
-      }
-      
+      if (newCats.length === 0) newCats.push(DEFAULT_CATEGORIES[0]);
       updateData(newLinks, newCats);
   };
 
-  // --- WebDAV Config ---
   const handleSaveWebDavConfig = (config: WebDavConfig) => {
       setWebDavConfig(config);
       localStorage.setItem(WEBDAV_CONFIG_KEY, JSON.stringify(config));
@@ -348,10 +442,26 @@ function App() {
       updateData(restoredLinks, restoredCategories);
       setIsBackupModalOpen(false);
   };
+  
+  // Updated Search Logic
+  const handleSearchSubmit = (e: React.FormEvent) => {
+      e.preventDefault();
+      if (!searchQuery.trim()) return;
+      
+      if (searchMode === 'external') {
+          const engine = externalEngines.find(e => e.id === activeEngineId) || externalEngines[0];
+          if (engine) {
+              window.open(engine.url + encodeURIComponent(searchQuery), '_blank');
+              setSearchQuery('');
+          }
+      }
+  };
 
-  // --- Filtering & Memo ---
+  const handleUpdateSearchEngines = (newEngines: SearchEngine[]) => {
+      setExternalEngines(newEngines);
+      localStorage.setItem(SEARCH_ENGINES_KEY, JSON.stringify(newEngines));
+  };
 
-  // Helper to check if a category is "Locked" (Has password AND not unlocked)
   const isCategoryLocked = (catId: string) => {
       const cat = categories.find(c => c.id === catId);
       if (!cat || !cat.password) return false;
@@ -359,94 +469,132 @@ function App() {
   };
 
   const pinnedLinks = useMemo(() => {
-      // Don't show pinned links if they belong to a locked category
       return links.filter(l => l.pinned && !isCategoryLocked(l.categoryId));
   }, [links, categories, unlockedCategoryIds]);
 
-  const displayedLinks = useMemo(() => {
-    let result = links;
-    
-    // Security Filter: Always hide links from locked categories
-    result = result.filter(l => !isCategoryLocked(l.categoryId));
+  const searchResults = useMemo(() => {
+    // Only filter locally if mode is 'local'
+    if (searchMode !== 'local') return links;
 
-    // Search Filter
+    let result = links;
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
-      return result.filter(l => 
+      result = result.filter(l => 
         l.title.toLowerCase().includes(q) || 
         l.url.toLowerCase().includes(q) ||
         (l.description && l.description.toLowerCase().includes(q))
       );
     }
+    return result;
+  }, [links, searchQuery, searchMode]);
 
-    // Category Filter
-    if (selectedCategory !== 'all') {
-      result = result.filter(l => l.categoryId === selectedCategory);
-    }
-    
-    return result.sort((a, b) => b.createdAt - a.createdAt);
-  }, [links, selectedCategory, searchQuery, categories, unlockedCategoryIds]);
-
+  const activeExternalEngine = useMemo(() => {
+      return externalEngines.find(e => e.id === activeEngineId) || externalEngines[0];
+  }, [externalEngines, activeEngineId]);
 
   // --- Render Components ---
 
-  const renderLinkCard = (link: LinkItem) => (
-    <a
-        key={link.id}
-        href={link.url}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="group relative flex items-center gap-3 p-3 bg-white dark:bg-slate-800 rounded-xl border border-slate-100 dark:border-slate-700/50 shadow-sm hover:shadow-lg hover:-translate-y-0.5 transition-all duration-200"
-        title={link.description || link.url} // Native tooltip fallback
-    >
-        {/* Compact Icon */}
-        <div className="w-8 h-8 rounded-lg bg-slate-50 dark:bg-slate-700 text-blue-600 dark:text-blue-400 flex items-center justify-center text-sm font-bold uppercase shrink-0">
-            {link.icon ? <img src={link.icon} alt="" className="w-5 h-5"/> : link.title.charAt(0)}
-        </div>
-        
-        {/* Text Content */}
-        <div className="flex-1 min-w-0">
-            <h3 className="font-medium text-sm text-slate-800 dark:text-slate-200 truncate group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">
-                {link.title}
-            </h3>
-            {link.description && (
-               <div className="tooltip-custom absolute left-0 -top-8 w-max max-w-[200px] bg-black text-white text-xs p-2 rounded opacity-0 invisible group-hover:visible group-hover:opacity-100 transition-all z-20 pointer-events-none truncate">
-                  {link.description}
-               </div>
+  const renderLinkCard = (link: LinkItem) => {
+      const iconDisplay = link.icon ? (
+         <img 
+            src={link.icon} 
+            alt="" 
+            className="w-5 h-5 object-contain" 
+            onError={(e) => {
+                e.currentTarget.style.display = 'none';
+                e.currentTarget.parentElement!.innerText = link.title.charAt(0);
+            }}
+         />
+      ) : link.title.charAt(0);
+      
+      const isSimple = siteSettings.cardStyle === 'simple';
+
+      return (
+        <a
+            key={link.id}
+            href={link.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            onContextMenu={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                let x = e.clientX;
+                let y = e.clientY;
+                // Boundary adjustment
+                if (x + 180 > window.innerWidth) x = window.innerWidth - 190;
+                if (y + 220 > window.innerHeight) y = window.innerHeight - 230;
+                setContextMenu({ x, y, link });
+                return false;
+            }}
+            className={`group relative flex flex-col ${isSimple ? 'p-2' : 'p-3'} bg-white dark:bg-slate-800 rounded-xl border border-slate-100 dark:border-slate-700/50 shadow-sm hover:shadow-lg hover:border-blue-200 dark:hover:border-slate-600 hover:-translate-y-0.5 transition-all duration-200 hover:bg-blue-50 dark:hover:bg-slate-750`}
+            title={link.description || link.url}
+        >
+            <div className={`flex items-center gap-3 ${isSimple ? '' : 'mb-1.5'} pr-6`}>
+                <div className={`${isSimple ? 'w-6 h-6 text-xs' : 'w-8 h-8 text-sm'} rounded-lg bg-slate-50 dark:bg-slate-700 text-blue-600 dark:text-blue-400 flex items-center justify-center font-bold uppercase shrink-0 overflow-hidden`}>
+                    {iconDisplay}
+                </div>
+                <h3 className="font-medium text-sm text-slate-800 dark:text-slate-200 truncate flex-1 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">
+                    {link.title}
+                </h3>
+            </div>
+            {!isSimple && (
+                <div className="text-xs text-slate-500 dark:text-slate-400 line-clamp-1 h-4 w-full overflow-hidden">
+                    {link.description || <span className="opacity-0">.</span>}
+                </div>
             )}
-        </div>
-
-        {/* Hover Actions (Absolute Right or Flex) */}
-        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity absolute right-2 bg-white/90 dark:bg-slate-800/90 pl-2">
-            <button 
-                onClick={(e) => togglePin(link.id, e)}
-                className={`p-1 rounded-md transition-colors ${link.pinned ? 'text-blue-500 bg-blue-50' : 'text-slate-400 hover:text-blue-500 hover:bg-slate-100 dark:hover:bg-slate-700'}`}
-                title="置顶"
-            >
-                <Pin size={13} className={link.pinned ? "fill-current" : ""} />
-            </button>
-            <button 
-                onClick={(e) => { e.preventDefault(); e.stopPropagation(); setEditingLink(link); setIsModalOpen(true); }}
-                className="p-1 text-slate-400 hover:text-blue-500 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-md"
-                title="编辑"
-            >
-                <Edit2 size={13} />
-            </button>
-            <button 
-                onClick={(e) => handleDeleteLink(link.id, e)}
-                className="p-1 text-slate-400 hover:text-red-500 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-md"
-                title="删除"
-            >
-                <Trash2 size={13} />
-            </button>
-        </div>
-    </a>
-  );
-
+        </a>
+      );
+  };
 
   return (
     <div className="flex h-screen overflow-hidden text-slate-900 dark:text-slate-50">
       
+      {/* Right Click Context Menu */}
+      {contextMenu && (
+          <div 
+             ref={contextMenuRef}
+             className="fixed z-[9999] bg-white dark:bg-slate-800 rounded-xl shadow-2xl border border-slate-100 dark:border-slate-600 w-44 py-2 flex flex-col animate-in fade-in zoom-in duration-100 overflow-hidden"
+             style={{ top: contextMenu.y, left: contextMenu.x }}
+             onClick={(e) => e.stopPropagation()}
+             onContextMenu={(e) => e.preventDefault()}
+          >
+             <button onClick={() => { handleCopyLink(contextMenu.link!.url); setContextMenu(null); }} className="flex items-center gap-3 px-4 py-2.5 text-sm hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 transition-colors text-left">
+                 <Copy size={16} className="text-slate-400"/> <span>复制链接</span>
+             </button>
+             <button onClick={() => { setQrCodeLink(contextMenu.link); setContextMenu(null); }} className="flex items-center gap-3 px-4 py-2.5 text-sm hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 transition-colors text-left">
+                 <QrCode size={16} className="text-slate-400"/> <span>显示二维码</span>
+             </button>
+             <div className="h-px bg-slate-100 dark:bg-slate-700 my-1 mx-2"/>
+             <button onClick={() => { if(!authToken) setIsAuthOpen(true); else { setEditingLink(contextMenu.link!); setIsModalOpen(true); setContextMenu(null); }}} className="flex items-center gap-3 px-4 py-2.5 text-sm hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 transition-colors text-left">
+                 <Edit2 size={16} className="text-slate-400"/> <span>编辑链接</span>
+             </button>
+             <button onClick={() => { togglePin(contextMenu.link!.id); setContextMenu(null); }} className="flex items-center gap-3 px-4 py-2.5 text-sm hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 transition-colors text-left">
+                 <Pin size={16} className={contextMenu.link!.pinned ? "fill-current text-blue-500" : "text-slate-400"}/> <span>{contextMenu.link!.pinned ? '取消置顶' : '置顶'}</span>
+             </button>
+             <div className="h-px bg-slate-100 dark:bg-slate-700 my-1 mx-2"/>
+             <button onClick={() => { handleDeleteLink(contextMenu.link!.id); setContextMenu(null); }} className="flex items-center gap-3 px-4 py-2.5 text-sm hover:bg-red-50 dark:hover:bg-red-900/20 text-red-500 transition-colors text-left">
+                 <Trash2 size={16}/> <span>删除链接</span>
+             </button>
+          </div>
+      )}
+
+      {/* QR Code Modal */}
+      {qrCodeLink && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm" onClick={() => setQrCodeLink(null)}>
+              <div className="bg-white p-6 rounded-2xl shadow-2xl flex flex-col items-center gap-4 animate-in zoom-in duration-200" onClick={e => e.stopPropagation()}>
+                  <h3 className="font-bold text-lg text-slate-800">{qrCodeLink.title}</h3>
+                  <div className="p-2 border border-slate-200 rounded-lg">
+                    <img 
+                        src={`https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(qrCodeLink.url)}`} 
+                        alt="QR Code" 
+                        className="w-48 h-48"
+                    />
+                  </div>
+                  <p className="text-xs text-slate-500 max-w-[200px] truncate">{qrCodeLink.url}</p>
+              </div>
+          </div>
+      )}
+
       <AuthModal isOpen={isAuthOpen} onLogin={handleLogin} />
       
       <CategoryAuthModal 
@@ -460,6 +608,7 @@ function App() {
         isOpen={isCatManagerOpen} 
         onClose={() => setIsCatManagerOpen(false)}
         categories={categories}
+        links={links}
         onUpdateCategories={handleUpdateCategories}
         onDeleteCategory={handleDeleteCategory}
       />
@@ -486,9 +635,20 @@ function App() {
         isOpen={isSettingsModalOpen}
         onClose={() => setIsSettingsModalOpen(false)}
         config={aiConfig}
+        siteSettings={siteSettings}
         onSave={handleSaveAIConfig}
         links={links}
+        categories={categories}
         onUpdateLinks={(newLinks) => updateData(newLinks, categories)}
+      />
+
+      <SearchSettingsModal
+        isOpen={isSearchSettingsOpen}
+        onClose={() => setIsSearchSettingsOpen(false)}
+        engines={externalEngines}
+        activeEngineId={activeEngineId}
+        onUpdateEngines={handleUpdateSearchEngines}
+        onSelectEngine={setActiveEngineId}
       />
 
       {/* Sidebar Mobile Overlay */}
@@ -507,21 +667,26 @@ function App() {
           ${sidebarOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}
         `}
       >
-        {/* Logo */}
-        <div className="h-16 flex items-center px-6 border-b border-slate-100 dark:border-slate-700 shrink-0">
-            <span className="text-xl font-bold bg-gradient-to-r from-blue-500 to-purple-500 bg-clip-text text-transparent">
-              云航 CloudNav
+        <div className="h-16 flex items-center px-6 border-b border-slate-100 dark:border-slate-700 shrink-0 gap-3">
+             <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white font-bold text-lg shadow-lg shadow-blue-500/30 overflow-hidden">
+                 {siteSettings.favicon ? (
+                    <img src={siteSettings.favicon} alt="" className="w-full h-full object-cover" />
+                 ) : (
+                    "C"
+                 )}
+             </div>
+            <span className="text-lg font-bold bg-gradient-to-r from-blue-600 to-purple-600 dark:from-blue-400 dark:to-purple-400 bg-clip-text text-transparent truncate">
+              {siteSettings.navTitle || 'CloudNav'}
             </span>
         </div>
 
-        {/* Categories List */}
         <div className="flex-1 overflow-y-auto p-4 space-y-1 scrollbar-hide">
             <button
-              onClick={() => { setSelectedCategory('all'); setSidebarOpen(false); }}
+              onClick={() => scrollToCategory('all')}
               className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all ${
-                selectedCategory === 'all' 
+                activeCategory === 'all' 
                   ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 font-medium' 
-                  : 'text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-700'
+                  : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700'
               }`}
             >
               <div className="p-1"><Icon name="LayoutGrid" size={18} /></div>
@@ -541,29 +706,29 @@ function App() {
 
             {categories.map(cat => {
                 const isLocked = cat.password && !unlockedCategoryIds.has(cat.id);
+                const isEmoji = cat.icon && cat.icon.length <= 4 && !/^[a-zA-Z]+$/.test(cat.icon);
+                
                 return (
                   <button
                     key={cat.id}
-                    onClick={() => handleCategoryClick(cat)}
+                    onClick={() => scrollToCategory(cat.id)}
                     className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-xl transition-all group ${
-                      selectedCategory === cat.id 
+                      activeCategory === cat.id 
                         ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 font-medium' 
-                        : 'text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-700'
+                        : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700'
                     }`}
                   >
-                    <div className={`p-1.5 rounded-lg transition-colors flex items-center justify-center ${selectedCategory === cat.id ? 'bg-blue-100 dark:bg-blue-800' : 'bg-slate-100 dark:bg-slate-800'}`}>
-                      {isLocked ? <Lock size={16} className="text-amber-500" /> : <Icon name={cat.icon} size={16} />}
+                    <div className={`p-1.5 rounded-lg transition-colors flex items-center justify-center ${activeCategory === cat.id ? 'bg-blue-100 dark:bg-blue-800' : 'bg-slate-100 dark:bg-slate-800'}`}>
+                      {isLocked ? <Lock size={16} className="text-amber-500" /> : (isEmoji ? <span className="text-base leading-none">{cat.icon}</span> : <Icon name={cat.icon} size={16} />)}
                     </div>
                     <span className="truncate flex-1 text-left">{cat.name}</span>
-                    {selectedCategory === cat.id && <div className="w-1.5 h-1.5 rounded-full bg-blue-500"></div>}
+                    {activeCategory === cat.id && <div className="w-1.5 h-1.5 rounded-full bg-blue-500"></div>}
                   </button>
                 );
             })}
         </div>
 
-        {/* Footer Actions */}
         <div className="p-4 border-t border-slate-100 dark:border-slate-700 bg-slate-50/50 dark:bg-slate-800/50 shrink-0">
-            
             <div className="grid grid-cols-3 gap-2 mb-2">
                 <button 
                     onClick={() => { if(!authToken) setIsAuthOpen(true); else setIsImportModalOpen(true); }}
@@ -573,7 +738,6 @@ function App() {
                     <Upload size={14} />
                     <span>导入</span>
                 </button>
-                
                 <button 
                     onClick={() => { if(!authToken) setIsAuthOpen(true); else setIsBackupModalOpen(true); }}
                     className="flex flex-col items-center justify-center gap-1 p-2 text-xs text-slate-600 dark:text-slate-300 hover:bg-white dark:hover:bg-slate-700 rounded-lg border border-slate-200 dark:border-slate-600 transition-all"
@@ -582,7 +746,6 @@ function App() {
                     <CloudCog size={14} />
                     <span>备份</span>
                 </button>
-
                 <button 
                     onClick={() => setIsSettingsModalOpen(true)}
                     className="flex flex-col items-center justify-center gap-1 p-2 text-xs text-slate-600 dark:text-slate-300 hover:bg-white dark:hover:bg-slate-700 rounded-lg border border-slate-200 dark:border-slate-600 transition-all"
@@ -600,7 +763,6 @@ function App() {
                  {syncStatus === 'error' && <AlertCircle className="w-3 h-3 text-red-500" />}
                  {authToken ? <span className="text-green-600">已同步</span> : <span className="text-amber-500">离线</span>}
                </div>
-
                <a 
                  href={GITHUB_REPO_URL} 
                  target="_blank" 
@@ -615,29 +777,101 @@ function App() {
         </div>
       </aside>
 
-      {/* Main Content */}
-      <main className="flex-1 flex flex-col h-full bg-slate-50 dark:bg-slate-900 overflow-hidden relative">
-        
-        {/* Header */}
-        <header className="h-16 px-4 lg:px-8 flex items-center justify-between bg-white/80 dark:bg-slate-800/80 backdrop-blur-md border-b border-slate-200 dark:border-slate-700 sticky top-0 z-10 shrink-0">
+      <main 
+          ref={mainRef}
+          className="flex-1 flex flex-col h-full bg-slate-50 dark:bg-slate-900 overflow-y-auto relative scroll-smooth"
+      >
+        <header className="h-16 px-4 lg:px-8 flex items-center justify-between bg-white/80 dark:bg-slate-800/80 backdrop-blur-md border-b border-slate-200 dark:border-slate-700 sticky top-0 z-30 shrink-0">
           <div className="flex items-center gap-4 flex-1">
             <button onClick={() => setSidebarOpen(true)} className="lg:hidden p-2 -ml-2 text-slate-600 dark:text-slate-300">
               <Menu size={24} />
             </button>
 
-            <div className="relative w-full max-w-md hidden sm:block">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
-              <input
-                type="text"
-                placeholder="搜索..."
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full pl-9 pr-4 py-2 rounded-full bg-slate-100 dark:bg-slate-700/50 border-none text-sm focus:ring-2 focus:ring-blue-500 dark:text-white placeholder-slate-400 outline-none transition-all"
-              />
+            {/* Redesigned Search Bar */}
+            <div className="relative w-full max-w-xl hidden sm:flex items-center gap-3">
+                {/* Search Mode Toggle (Pill) */}
+                <div className="bg-slate-100 dark:bg-slate-700 p-1 rounded-full flex items-center shrink-0">
+                    <button
+                        onClick={() => setSearchMode('local')}
+                        className={`px-3 py-1.5 text-sm font-medium rounded-full transition-all ${
+                            searchMode === 'local' 
+                            ? 'bg-white dark:bg-slate-600 text-slate-900 dark:text-white shadow-sm' 
+                            : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300'
+                        }`}
+                    >
+                        站内
+                    </button>
+                    <button
+                        onClick={() => setSearchMode('external')}
+                        className={`px-3 py-1.5 text-sm font-medium rounded-full transition-all ${
+                            searchMode === 'external' 
+                            ? 'bg-white dark:bg-slate-600 text-blue-600 dark:text-blue-400 shadow-sm' 
+                            : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300'
+                        }`}
+                    >
+                        站外
+                    </button>
+                </div>
+
+                {/* Settings Gear (Visible only for External) */}
+                {searchMode === 'external' && (
+                    <button 
+                        onClick={() => setIsSearchSettingsOpen(true)}
+                        className="p-2 text-slate-400 hover:text-blue-500 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-full transition-colors animate-in fade-in slide-in-from-left-2 duration-200"
+                        title="管理搜索引擎"
+                    >
+                        <Settings size={18} />
+                    </button>
+                )}
+
+                {/* Search Input */}
+                <form onSubmit={handleSearchSubmit} className="flex-1 relative flex items-center group">
+                    <input
+                        ref={searchInputRef}
+                        type="text"
+                        placeholder={searchMode === 'local' ? "搜索书签..." : `在 ${activeExternalEngine?.name} 搜索...`}
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        className="w-full pl-10 pr-4 py-2 bg-slate-100 dark:bg-slate-700/50 hover:bg-white dark:hover:bg-slate-700 border border-transparent hover:border-slate-200 dark:hover:border-slate-600 rounded-full text-sm dark:text-white placeholder-slate-400 outline-none transition-all focus:bg-white dark:focus:bg-slate-700 focus:ring-2 focus:ring-blue-500/50"
+                    />
+                    <div className="absolute left-3 text-slate-400 pointer-events-none flex items-center gap-2">
+                        {searchMode === 'local' ? (
+                            <Search size={16} />
+                        ) : activeExternalEngine?.icon?.startsWith('http') ? (
+                            <img src={activeExternalEngine.icon} className="w-4 h-4 rounded-full object-cover" />
+                        ) : (
+                            <Search size={16} />
+                        )}
+                    </div>
+                    
+                    {/* Visual Indicator for Search */}
+                    {searchQuery && (
+                        <button type="submit" className="absolute right-2 p-1.5 bg-blue-100 dark:bg-blue-900/40 text-blue-600 rounded-full hover:bg-blue-200 transition-colors">
+                            <ArrowRight size={14} />
+                        </button>
+                    )}
+                </form>
             </div>
           </div>
 
           <div className="flex items-center gap-2">
+            <div className="hidden md:flex bg-slate-100 dark:bg-slate-700 rounded-lg p-1 mr-2">
+                <button 
+                    onClick={() => authToken && updateData(links, categories, { ...siteSettings, cardStyle: 'simple' })}
+                    title="简约模式"
+                    className={`p-1.5 rounded transition-all ${siteSettings.cardStyle === 'simple' ? 'bg-white dark:bg-slate-600 shadow text-blue-600' : 'text-slate-400 hover:text-slate-600'}`}
+                >
+                    <LayoutGrid size={16} />
+                </button>
+                <button 
+                    onClick={() => authToken && updateData(links, categories, { ...siteSettings, cardStyle: 'detailed' })}
+                    title="详情模式"
+                    className={`p-1.5 rounded transition-all ${siteSettings.cardStyle === 'detailed' ? 'bg-white dark:bg-slate-600 shadow text-blue-600' : 'text-slate-400 hover:text-slate-600'}`}
+                >
+                    <List size={16} />
+                </button>
+            </div>
+
             <button onClick={toggleTheme} className="p-2 rounded-full text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700">
               {darkMode ? <Sun size={18} /> : <Moon size={18} />}
             </button>
@@ -657,11 +891,9 @@ function App() {
           </div>
         </header>
 
-        {/* Content Scroll Area */}
-        <div className="flex-1 overflow-y-auto p-4 lg:p-8 space-y-8">
+        <div className="p-4 lg:p-8 space-y-8">
             
-            {/* 1. Pinned Area (Custom Top Area) */}
-            {pinnedLinks.length > 0 && !searchQuery && (selectedCategory === 'all') && (
+            {pinnedLinks.length > 0 && !searchQuery && (
                 <section>
                     <div className="flex items-center gap-2 mb-4">
                         <Pin size={16} className="text-blue-500 fill-blue-500" />
@@ -669,64 +901,77 @@ function App() {
                             置顶 / 常用
                         </h2>
                     </div>
-                    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 gap-3">
+                    <div className={`grid gap-3 ${siteSettings.cardStyle === 'simple' ? 'grid-cols-2 md:grid-cols-5 lg:grid-cols-8 xl:grid-cols-10' : 'grid-cols-2 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8'}`}>
                         {pinnedLinks.map(link => renderLinkCard(link))}
                     </div>
                 </section>
             )}
 
-            {/* 2. Main Grid */}
-            <section>
-                 {(!pinnedLinks.length && !searchQuery && selectedCategory === 'all') && (
-                    <div className="mb-6 p-4 rounded-xl bg-gradient-to-r from-blue-500 to-indigo-600 text-white shadow-lg flex items-center justify-between">
-                         <div>
-                            <h1 className="text-xl font-bold">早安 👋</h1>
-                            <p className="text-sm opacity-90 mt-1">
-                                {links.length} 个链接 · {categories.length} 个分类
-                            </p>
-                         </div>
-                         <Icon name="Compass" size={48} className="opacity-20" />
-                    </div>
-                 )}
+            {categories.map(cat => {
+                let catLinks = searchResults.filter(l => l.categoryId === cat.id);
+                const isLocked = cat.password && !unlockedCategoryIds.has(cat.id);
+                
+                // Logic Fix: If External Search, do NOT hide categories based on links
+                // Because external search doesn't filter links.
+                // However, the user probably wants to see the links grid even when typing for external search
+                // Current logic: if search query exists AND local search -> filter. 
+                // If search query exists AND external search -> show all (searchResults returns all).
+                
+                if (searchQuery && searchMode === 'local' && catLinks.length === 0) return null;
 
-                 <div className="flex items-center justify-between mb-4">
-                     <h2 className="text-sm font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 flex items-center gap-2">
-                         {selectedCategory === 'all' 
-                            ? (searchQuery ? '搜索结果' : '所有链接') 
-                            : (
-                                <>
-                                    {categories.find(c => c.id === selectedCategory)?.name}
-                                    {isCategoryLocked(selectedCategory) && <Lock size={14} className="text-amber-500" />}
-                                </>
-                            )
-                         }
-                     </h2>
-                 </div>
-
-                 {displayedLinks.length === 0 ? (
-                    <div className="flex flex-col items-center justify-center py-20 text-slate-400 border-2 border-dashed border-slate-200 dark:border-slate-700 rounded-xl">
-                        {isCategoryLocked(selectedCategory) ? (
-                            <>
-                                <Lock size={40} className="text-amber-400 mb-4" />
-                                <p>该目录已锁定</p>
-                                <button onClick={() => setCatAuthModalData(categories.find(c => c.id === selectedCategory) || null)} className="mt-4 px-4 py-2 bg-amber-500 text-white rounded-lg">输入密码解锁</button>
-                            </>
+                return (
+                    <section key={cat.id} id={`cat-${cat.id}`} className="scroll-mt-24">
+                        <div className="flex items-center gap-2 mb-4 pb-2 border-b border-slate-100 dark:border-slate-800">
+                             <div className="text-slate-400">
+                                {cat.icon && cat.icon.length <= 4 && !/^[a-zA-Z]+$/.test(cat.icon) ? <span className="text-lg">{cat.icon}</span> : <Icon name={cat.icon} size={20} />}
+                             </div>
+                             <h2 className="text-lg font-bold text-slate-800 dark:text-slate-200">
+                                 {cat.name}
+                             </h2>
+                             {isLocked && <Lock size={16} className="text-amber-500" />}
+                        </div>
+                        
+                        {isLocked ? (
+                             <div className="bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-slate-700 p-8 flex flex-col items-center justify-center text-center">
+                                <div className="w-12 h-12 bg-amber-100 dark:bg-amber-900/30 rounded-full flex items-center justify-center mb-4 text-amber-600 dark:text-amber-400">
+                                    <Lock size={24} />
+                                </div>
+                                <h3 className="text-slate-800 dark:text-slate-200 font-medium mb-1">私密目录</h3>
+                                <p className="text-sm text-slate-500 dark:text-slate-400 mb-4">该分类已加密，需要验证密码才能查看内容</p>
+                                <button 
+                                    onClick={() => setCatAuthModalData(cat)}
+                                    className="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-sm font-medium transition-colors"
+                                >
+                                    输入密码解锁
+                                </button>
+                             </div>
                         ) : (
-                            <>
-                                <Search size={40} className="opacity-30 mb-4" />
-                                <p>没有找到相关内容</p>
-                                {selectedCategory !== 'all' && (
-                                    <button onClick={() => setIsModalOpen(true)} className="mt-4 text-blue-500 hover:underline">添加一个?</button>
+                             <>
+                                {catLinks.length === 0 ? (
+                                    <div className="text-center py-8 text-slate-400 text-sm italic">
+                                        暂无链接
+                                    </div>
+                                ) : (
+                                    <div className={`grid gap-3 ${siteSettings.cardStyle === 'simple' ? 'grid-cols-2 md:grid-cols-5 lg:grid-cols-8 xl:grid-cols-10' : 'grid-cols-2 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8'}`}>
+                                        {catLinks.map(link => renderLinkCard(link))}
+                                    </div>
                                 )}
-                            </>
+                             </>
                         )}
-                    </div>
-                 ) : (
-                    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 gap-3">
-                        {displayedLinks.map(link => renderLinkCard(link))}
-                    </div>
-                 )}
-            </section>
+                    </section>
+                );
+            })}
+            
+            {/* Empty State for Local Search */}
+            {searchQuery && searchMode === 'local' && searchResults.length === 0 && (
+                <div className="flex flex-col items-center justify-center py-20 text-slate-400">
+                    <Search size={40} className="opacity-30 mb-4" />
+                    <p>没有找到相关内容</p>
+                    <button onClick={() => setIsModalOpen(true)} className="mt-4 text-blue-500 hover:underline">添加一个?</button>
+                </div>
+            )}
+
+            <div className="h-20"></div>
         </div>
       </main>
 
@@ -735,6 +980,7 @@ function App() {
         onClose={() => { setIsModalOpen(false); setEditingLink(undefined); setPrefillLink(undefined); }}
         onSave={editingLink ? handleEditLink : handleAddLink}
         categories={categories}
+        existingLinks={links}
         initialData={editingLink || (prefillLink as LinkItem)}
         aiConfig={aiConfig}
       />
